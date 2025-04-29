@@ -1,0 +1,773 @@
+---
+title: "Coding_Thesis_ZhengLuo"
+author: "Zheng Luo"
+date: "2025-02-23"
+output:
+  html_document:
+    df_print: paged
+  output: null
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+---
+
+# Use data of alcohol intake, hypertension, age, sleep quality, BMI, family income, race from NHANES
+```{r}
+# Packages
+suppressPackageStartupMessages({
+library(broom)
+library(car)
+library(carData)
+library(cardx)
+library(caret)
+library(caTools)
+library(dplyr)
+library(DMwR2)
+library(e1071)
+library(fastshap)
+library(forcats)
+library(ggbeeswarm)
+library(ggeffects)
+library(ggplot2)
+library(gtsummary)
+library(haven)
+library(htmltools)
+library(iml)
+library(kernlab)
+library(patchwork)
+library(pROC)
+library(purrr)
+library(randomForest)
+library(ResourceSelection)
+library(rlang)
+library(SHAPforxgboost)
+library(shapr)
+library(shapviz)
+library(smotefamily)
+library(tableone)
+library(UBL)
+library(vip)
+library(xgboost)
+})
+
+# Load datasets
+data_demo <- read_xpt("P_DEMO.xpt")   
+data_bmi <- read_xpt("P_BMX.xpt")     
+data_bp <- read_xpt("P_BPXO.xpt")     
+data_alcohol <- read_xpt("P_ALQ.xpt") 
+data_income <- read_xpt("P_INQ.xpt")  
+data_sleep <- read_xpt("P_SLQ.xpt")
+```
+
+## Select and rename variables
+```{r}
+#demographic data
+selected_data_demo <- data_demo %>%
+  select(SEQN, gender = RIAGENDR, age = RIDAGEYR, race = RIDRETH3)
+
+# Filter out unreasonable age values and keep adults aged 18-100
+selected_data_demo <- selected_data_demo %>%
+  filter(age >= 18 & age <= 100)
+
+# Create an age group variable
+selected_data_demo <- selected_data_demo %>%
+  mutate(
+    age_group = case_when(
+      age >= 18 & age < 40 ~ "18-39",
+      age >= 40 & age < 60 ~ "40 - 59",
+      age >= 60 & age < 100 ~ "60+"
+    )
+  )
+
+# Recode gender
+selected_data_demo <- selected_data_demo %>%
+  mutate(
+    gender = factor(gender, levels = c(1, 2), labels = c("Male", "Female"))
+  )
+
+# Recode race (according to RIDRETH3)
+selected_data_demo <- selected_data_demo %>%
+  mutate(
+    race = factor(race, levels = c(1, 2, 3, 4, 6, 7),
+                  labels = c("Mexican American", "Other Hispanic", 
+                             "Non-Hispanic White", "Non-Hispanic Black", 
+                             "Non-Hispanic Asian", "Other Race"))
+  )
+
+# View Distribution
+table(selected_data_demo$gender)
+table(selected_data_demo$race)
+table(selected_data_demo$age_group)
+```
+## BMI
+```{r}
+#BMI
+selected_data_bmi <- data_bmi %>%
+  select(SEQN, BMI = BMXBMI)
+
+# Remove rows with missing values ..for BMI
+selected_data_bmi <- selected_data_bmi %>%
+  filter(!is.na(BMI))
+```
+
+## Hypertension
+```{r}
+# Remove rows with missing values for the blood pressure variable
+data_bp_no_missing <- data_bp %>%
+  filter(!is.na(BPXOSY1), !is.na(BPXOSY2), !is.na(BPXOSY3),
+         !is.na(BPXODI1), !is.na(BPXODI2), !is.na(BPXODI3))
+
+# Remove unnecessary variables
+data_bp_no_missing <- data_bp_no_missing %>%
+  select(-BPXOPLS1, -BPXOPLS2, -BPXOPLS3, -BPAOARM, -BPAOCSZ)
+
+# Calculate mean systolic and diastolic blood pressure
+data_bp_processed <- data_bp_no_missing %>%
+  mutate(
+    systolic_avg = rowMeans(select(., BPXOSY1, BPXOSY2, BPXOSY3)),  # Mean systolic blood pressure
+    diastolic_avg = rowMeans(select(., BPXODI1, BPXODI2, BPXODI3))  # Mean diastolic blood pressure
+  ) %>%
+  select(-BPXOSY1, -BPXOSY2, -BPXOSY3, -BPXODI1, -BPXODI2, -BPXODI3)  # Delete the original blood pressure variable
+
+# Visualization
+# View systolic and diastolic blood pressure distribution
+ggplot(data_bp_processed, aes(x = systolic_avg)) + 
+  geom_histogram(bins = 30, fill = "skyblue") + 
+  ggtitle("Systolic blood pressure distribution")
+
+ggplot(data_bp_processed, aes(x = diastolic_avg)) + 
+  geom_histogram(bins = 30, fill = "lightgreen") + 
+  ggtitle("Diastolic blood pressure distribution")
+
+# Eliminate outliers
+data_bp_processed <- data_bp_processed %>%
+  filter(systolic_avg >= 70 & systolic_avg <= 250,
+         diastolic_avg >= 40 & diastolic_avg <= 150)
+
+# Create Hypertension Variable (Outcome/Target)
+data_bp_processed <- data_bp_processed %>%
+  mutate(
+    hypertension = if_else(systolic_avg >= 140 | diastolic_avg >= 90, 1, 0)
+  )
+```
+
+## Drinking
+```{r}
+# Rename
+selected_data_alcohol <- data_alcohol %>%
+  select(SEQN, drinking_frequency = ALQ121)
+
+# delete Rows with values of 77, 99, or NA in drinking_frequency and drinking_intensity 
+selected_data_alcohol <- selected_data_alcohol %>%
+  filter(
+    !drinking_frequency %in% c(77, 99),
+    !is.na(drinking_frequency)
+  )
+
+# Create a categorical variable for drinking alcohol
+selected_data_alcohol <- selected_data_alcohol %>%
+  mutate(
+    drinking_category = case_when(
+      drinking_frequency == 0 ~ "Non-drinker",
+      
+      # Light drinker:  ≤2 per month
+      drinking_frequency %in% 7:10 ~ "Light drinker",
+      
+      # Moderate drinker: 1–3 per week
+      drinking_frequency %in% 4:6  ~ "Moderate drinker",
+      
+      # Heavy drinker:  ≥4 per week
+      drinking_frequency %in% 1:3 ~ "Heavy drinker",
+      
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(-drinking_frequency)  # Remove the original drinking_frequency
+```
+
+## Family income
+```{r}
+#income
+selected_data_income <- data_income %>%
+  select(SEQN, family_income = INDFMMPC)
+
+selected_data_income <- data_income %>%
+  select(SEQN, family_income = INDFMMPC) %>%
+  filter(family_income %in% c(1, 2, 3)) %>%
+  mutate(
+    family_income = factor(family_income,
+                           levels = c(1, 2, 3),
+                           labels = c("Low", "Medium", "High"),
+                           ordered = FALSE)
+  )
+```
+
+## Sleep problem
+```{r}
+#sleep
+selected_data_sleep <- data_sleep %>%
+  select(SEQN, sleep_problem = SLQ050)
+
+selected_data_sleep <- data_sleep %>%
+  select(SEQN, sleep_problem = SLQ050) %>%
+  filter(sleep_problem %in% c(1, 2)) %>%
+  mutate(
+    sleep_problem = factor(sleep_problem,
+                           levels = c(1, 2),
+                           labels = c("Yes", "No"))
+  )
+```
+
+# Merge dataset
+```{r}
+# Put all preprocessed data frames into a list
+data_list <- list(
+  selected_data_demo,    # age, gender, race
+  selected_data_bmi,     # BMI
+  data_bp_processed,     # Blood pressure data (including hypertension variables)
+  selected_data_alcohol, # Drinking
+  selected_data_income,  # Income
+  selected_data_sleep    # Sleep Quality
+)
+
+# Use reduce and inner_join to combine all datasets
+merged_data <- reduce(data_list, inner_join, by = "SEQN")
+
+# View the merged data frame structure and sample size
+glimpse(merged_data)
+cat("merged population size:", nrow(merged_data), "rows\n")
+```
+
+# Bias analysis
+```{r, eval=FALSE}
+# View the merged data frame structure and sample size
+glimpse(merged_data)
+cat("merged population size:", nrow(merged_data), "rows\n")
+
+# Create full data frame with an included tag 
+# Start by integrating all those with SEQN into full_data
+full_data_list <- list(
+  selected_data_demo,
+  selected_data_bmi,
+  data_bp_processed,
+  selected_data_alcohol,
+  selected_data_income,
+  selected_data_sleep
+)
+
+# Outgoing connection full_data, retaining all those who have participated in the data source
+full_data <- reduce(full_data_list, full_join, by = "SEQN")
+
+# Add included variable
+full_data <- full_data %>%
+  mutate(
+    included = if_else(SEQN %in% merged_data$SEQN, 1, 0)
+  )
+
+# Deviation analysis 
+# View the distribution of inclusion and exclusion
+cat("Included sample size:", sum(full_data$included == 1), "\n")
+cat("Excluded sample size:", sum(full_data$included == 0), "\n")
+
+#Compare Age (continuous variable)
+t_test_age <- t.test(age ~ included, data = full_data)
+print(t_test_age)
+
+# Comparison Gender (categorical variable)
+table_gender <- table(full_data$gender, full_data$included)
+chisq_gender <- chisq.test(table_gender)
+print(chisq_gender)
+
+# Compare Race (categorical variable)
+table_race <- table(full_data$race, full_data$included)
+chisq_race <- chisq.test(table_race)
+print(chisq_race)
+
+# Comparison BMI (continuous variable)
+t_test_bmi <- t.test(BMI ~ included, data = full_data)
+print(t_test_bmi)
+
+# Comparison Family Income (categorical variable)
+table_income <- table(full_data$family_income, full_data$included)
+chisq_income <- chisq.test(table_income)
+print(chisq_income)
+
+# Comparing Sleep Problem (Categorical Variable)
+table_sleep <- table(full_data$sleep_problem, full_data$included)
+chisq_sleep <- chisq.test(table_sleep)
+print(chisq_sleep)
+
+library(broom)
+summary_bias <- bind_rows(
+  tidy(t_test_age) %>% mutate(variable = "Age"),
+  tidy(chisq_gender) %>% mutate(variable = "Gender"),
+  tidy(chisq_race) %>% mutate(variable = "Race"),
+  tidy(t_test_bmi) %>% mutate(variable = "BMI"),
+  tidy(chisq_income) %>% mutate(variable = "Family Income"),
+  tidy(chisq_sleep) %>% mutate(variable = "Sleep Problem")
+)
+
+print(summary_bias)
+```
+
+## Table1. Univariable analysis of alcohol intake and hypertension, key variables among U.S. adults, National Health and Nutrition Examination Survey (NHANES), United States, 2017-2020, n=6175
+```{r}
+variables_for_table1 <- c(
+  "age", "age_group", "gender", "race", "BMI", "family_income",
+  "sleep_problem", "drinking_category", "hypertension"
+)
+
+factor_vars <- c("age_group", "gender", "race", "family_income", "sleep_problem", "drinking_category", "hypertension")
+
+# Table 1
+table1 <- CreateTableOne(
+  vars = variables_for_table1, 
+  data = merged_data, 
+  factorVars = factor_vars
+)
+
+# print
+print(table1, showAllLevels = TRUE, exact = c("age", "BMI"), digits = 2)
+```
+
+## Table2. Bivariable associations between alcohol intake and hypertension, and key demographic characteristics and other features among U.S. adults, National Health and Nutrition Examination Survey (NHANES), United States, 2017–2020, n=6175
+```{r}
+variables_for_table2 <- c(
+  "age", "age_group", "gender", "race", "BMI", "family_income",
+  "sleep_problem", "drinking_category"
+)
+
+table2 <- merged_data %>%
+  select(all_of(variables_for_table2), hypertension) %>%
+  tbl_summary(
+    by = hypertension,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no"
+  ) %>%
+  add_p(test = list(
+    age ~ "t.test",
+    BMI ~ "t.test",
+    age_group ~ "chisq.test",
+    gender ~ "chisq.test",
+    race ~ "chisq.test",
+    family_income ~ "chisq.test",
+    sleep_problem ~ "chisq.test",
+    drinking_category ~ "chisq.test"
+  )) %>%
+  modify_header(label = "**Key Characteristics**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Hypertension Status**") %>%
+  modify_caption("**Table 2. Bivariable Associations Between Covariates and Hypertension**") %>%
+  modify_table_body(~ .x %>% dplyr::mutate(show = TRUE))
+
+table2
+```
+
+# Handling of category variables
+
+# Divide the data set
+```{r}
+set.seed(123)
+
+# Use sample.split() to split the dataset, 70% training set, 30% test set
+split <- sample.split(merged_data$hypertension, SplitRatio = 0.7)  #  70% training set, 30% test set
+
+# Create training and test sets
+train_data <- subset(merged_data, split == TRUE)
+test_data <- subset(merged_data, split == FALSE)
+
+# Delete unique ID
+train_data <- train_data %>% select(-SEQN)
+test_data  <- test_data %>% select(-SEQN)
+
+
+# View the size of the segmented dataset
+cat("Training set size:", nrow(train_data), "\n")
+cat("Test set size:", nrow(test_data), "\n")
+str(train_data)
+```
+
+# Start ML modeling
+## Model 1: XGBoost modeling
+```{r}
+# ===============================
+# 2.Categorical Variable Processing
+# ===============================
+train_data <- train_data %>%
+  mutate(across(c(drinking_category, sleep_problem, gender, race, family_income), as.factor))
+
+test_data <- test_data %>%
+  mutate(across(c(drinking_category, sleep_problem, gender, race, family_income), as.factor))
+
+# ===============================
+# 3. Creation of model matrix (One-Hot Encoding)
+# ===============================
+dummies <- dummyVars(~ drinking_category + sleep_problem + family_income + 
+                       gender + race + BMI + age,
+                     data = train_data,
+                     fullRank = FALSE)
+
+train_matrix <- predict(dummies, newdata = train_data) %>% as.matrix()
+test_matrix <- predict(dummies, newdata = test_data) %>% as.matrix()
+
+# ===============================
+# 4. tagged variable
+# ===============================
+train_label <- as.factor(ifelse(train_data$hypertension == 1, "Yes", "No"))
+test_label <- as.factor(ifelse(test_data$hypertension == 1, "Yes", "No"))
+
+# ===============================
+# 5. Category imbalance treatment
+# ===============================
+pos_weight <- sum(train_label == "No") / sum(train_label == "Yes")
+
+# ===============================
+# 6. Setting up the tuning grid
+# ===============================
+grid <- expand.grid(
+  nrounds = 152,
+  max_depth = 4,
+  eta = 0.1983480,             # learning_rate
+  gamma = 2.4524281,
+  colsample_bytree = 0.6776641,
+  min_child_weight = 8,
+  subsample = 0.9532573
+)
+
+
+# ===============================
+# 7. Setting up cross-validation controls
+# ===============================
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  verboseIter = TRUE
+)
+
+# ===============================
+# 8. Model training (main effects modeling)
+# ===============================
+set.seed(123)
+
+pos_weight <- sum(train_label == "No") / sum(train_label == "Yes")
+
+# Setting sample weights
+weights <- ifelse(train_label == "Yes", pos_weight, 1)
+
+xgb_model <- train(
+  x = train_matrix,
+  y = train_label,
+  method = "xgbTree",
+  trControl = control,
+  tuneGrid = grid,
+  metric = "ROC",
+  weights = weights
+)
+
+# ===============================
+# 9. Model Evaluation
+# ===============================
+print(xgb_model)
+
+# Getting model probabilities
+test_pred_prob <- predict(xgb_model, newdata = test_matrix, type = "prob")[, "Yes"]
+
+# Manually set classification thresholds
+custom_threshold <- 0.25
+test_pred_label <- ifelse(test_pred_prob >= custom_threshold, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+
+# ROC & AUC
+roc_obj <- roc(test_label, test_pred_prob)
+plot(roc_obj, main = "ROC Curve - XGBoost Main Effect Model")
+auc_value <- auc(roc_obj)
+cat("Test AUC:", auc_value, "\n")
+
+# Confusion Matrix Evaluation 
+confusionMatrix(test_pred_label, test_label, positive = "Yes")
+```
+
+```{r}
+xgb_booster <- xgb_model$finalModel
+
+#Get feature names
+feature_names <- colnames(train_matrix)
+
+# Calculating the importance of a variable
+importance_table <- xgb.importance(feature_names = feature_names, model = xgb_booster)
+
+importance_table
+```
+
+## Model 2: Random Forest
+```{r}
+# 1. Create model labels (convert 0/1 to “No”/“Yes”)
+train_label_rf <- factor(train_data$hypertension, levels = c(0, 1), labels = c("No", "Yes"))
+test_label_rf  <- factor(test_data$hypertension, levels = c(0, 1), labels = c("No", "Yes"))
+
+rf_grid <- expand.grid(
+  mtry = 12
+)
+
+# Use 5-fold cross validation, utilize caret package for tuning, and perform up-sampling in cross validation
+set.seed(123)
+rf_model <- train(
+  x = train_matrix,
+  y = train_label_rf,
+  method = "rf",
+  ntree = 700,        
+  nodesize = 5,        
+  maxnodes = 30,       
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    classProbs = TRUE, 
+    summaryFunction = twoClassSummary,
+    verboseIter = TRUE,
+    sampling = "up" 
+  ),
+  tuneGrid = rf_grid, 
+  metric = "ROC"
+)
+
+print(rf_model)
+
+# predictions on the test set, calculate ROC curves and AUC
+rf_test_pred_prob <- predict(rf_model, newdata = test_matrix, type = "prob")[, "Yes"]
+
+rf_roc_obj <- roc(test_label_rf, rf_test_pred_prob)
+plot(rf_roc_obj, main = "ROC Curve - Random Forest Model (Upsampling)")
+cat("Random Forest Test AUC:", auc(rf_roc_obj), "\n")
+```
+
+## Model 3: SVM
+```{r}
+set.seed(123)
+
+# Extract feature data (x_train) and target variables (y_train)
+X_train <- train_data[, setdiff(names(train_data), "hypertension")]
+y_train <- train_data$hypertension
+y_train <- as.integer(y_train)
+
+# Create dummyVars object
+dummy <- dummyVars(~ ., data = X_train)
+
+# Convert to a purely numeric matrix
+X_train_numeric <- predict(dummy, X_train)
+
+train_df <- data.frame(
+  X_train_numeric,
+  hypertension = factor(y_train, levels = c(0, 1), labels = c("No", "Yes"))
+)
+
+# Checking the newly created train_df
+str(train_df)
+
+smote_data <- SmoteClassif(hypertension ~ ., dat = train_df, C.perc = "balance", k = 5)
+
+# Separation of feature data from target variables
+X_train_smote <- smote_data[, setdiff(names(smote_data), "hypertension")]
+y_train_smote <- smote_data$hypertension
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Parametric grid search (SVM with RBF kernel)
+svm_grid <- expand.grid(
+  C = 8,
+  sigma = 0.015625
+)
+
+# Training the SVM model
+set.seed(123)
+svm_model <- train(
+  x = X_train_smote,
+  y = y_train_smote,
+  method = "svmRadial",
+  trControl = ctrl,
+  tuneGrid = svm_grid,
+  metric = "ROC",
+  preProcess = c("center", "scale")
+)
+
+
+print(svm_model)
+```
+
+## Permutation Importance
+```{r}
+# 1.Calculate the importance of alignment
+vi <- varImp(svm_model, scale = TRUE)
+
+# 2. Define the plotting function and return the ggplot object.
+ggplot_imp <- function(imp_obj, top_n = 15) {
+  imp_df <- as.data.frame(imp_obj$importance)
+  imp_df$Variable <- rownames(imp_df)
+  imp_df$Importance <- imp_df$No  # 也可以用 imp_df$Yes
+  
+  # Sorting + top_n features
+  imp_df <- imp_df[order(-imp_df$Importance), ]
+  imp_df <- head(imp_df, top_n)
+  
+  ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(
+      title = "Variable Importance (Permutation)",
+      x = "Features",
+      y = "Importance"
+    ) +
+    theme_minimal()
+}
+
+# 3. Drawing and saving as an object
+perm_plot <- ggplot_imp(vi)
+
+# 4. Export as PNG file
+ggsave("figure1_permutation_importance.png", plot = perm_plot, width = 7, height = 5, dpi = 300)
+
+ggplot_imp(vi)
+```
+
+## SHAP
+```{r}
+# 2. Define the prediction function (adapted to your SVM model)
+pfun <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "Yes"] # Predicting the probability of high blood pressure
+}
+
+# 3. Preparation of explanatory data (using 100 representative samples)
+set.seed(123)
+sample_indices <- sample(1:nrow(X_train_smote), 
+                     size = min(100, nrow(X_train_smote)))
+X_explain <- X_train_smote[sample_indices, ]
+
+
+# 4. Calculate the SHAP value 
+system.time({
+  shap_values <- fastshap::explain(
+    svm_model,
+    X = X_explain,
+    pred_wrapper = pfun,
+    nsim = 50,          # Reduced number of simulations to accelerate calculations
+    adjust = TRUE,       # Calibrate SHAP values so that the sum is equal to the predicted value
+    .verbose = FALSE     # Change this parameter to show progress information
+  )
+})
+
+# 5. SHAP Summary Chart (showing the top 15 features)
+shap_summary_plot <- function(shap_values, X_data, top_n = 15) {
+  # Calculate the average absolute SHAP value
+  mean_shap <- colMeans(abs(shap_values))
+  top_features <- names(sort(mean_shap, decreasing = TRUE))[1:top_n]
+  
+  # data
+  plot_data <- data.frame(
+    shap_value = as.vector(as.matrix(shap_values[, top_features])),
+    feature_value = as.vector(as.matrix(X_data[, top_features])),
+    feature = rep(top_features, each = nrow(X_data))
+  )
+  
+  # plot
+  ggplot(plot_data, aes(x = shap_value, y = reorder(feature, abs(shap_value)))) +
+    ggbeeswarm::geom_quasirandom(aes(color = feature_value), 
+                               alpha = 0.7, size = 2) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = median(plot_data$feature_value)) +
+    labs(x = "SHAP value", y = "Feature", 
+         title = "SHAP Summary Plot",
+         subtitle = "Impact of features on hypertension prediction",
+         color = "Feature value") +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+# Show Summary Chart
+shap_summary_plot(shap_values, X_explain)
+
+# 6. Individual feature dependency maps (automatically plotting the first 3 important features)
+shap_dependence_plot <- function(shap_values, X_data, feature) {
+  data.frame(
+    shap = shap_values[[feature]],
+    value = X_data[[feature]]
+  ) %>%
+    ggplot(aes(x = value, y = shap)) +
+    geom_point(alpha = 0.6, color = "steelblue") +
+    geom_smooth(color = "red", se = FALSE, method = "loess") +
+    labs(x = feature, y = "SHAP value",
+         title = paste("SHAP Dependence Plot for", feature)) +
+    theme_minimal()
+}
+
+# Get the 3 most important features
+top3_features <- names(sort(colMeans(abs(shap_values)), decreasing = TRUE))[1:3]
+```
+
+
+
+```{r}
+# 1. Make sure shap_values is a dataframe
+shap_values <- as.data.frame(shap_values)
+
+# 2.  Get top 3 important variables
+mean_abs_shap <- colMeans(abs(shap_values))
+top3_features <- names(sort(mean_abs_shap, decreasing = TRUE))[1:3]
+print(top3_features)  # Confirm top3, usually systolic_avg, diastolic_avg, BMI
+
+# 3. Defining Secure SHAP Dependency Graph Functions
+shap_dependence_plot <- function(shap_df, X_df, feature) {
+  if (!feature %in% colnames(shap_df) || !feature %in% colnames(X_df)) {
+    stop(paste("feature", feature, "Not present in the data"))
+  }
+  plot_data <- data.frame(
+    shap = shap_df[, feature, drop = TRUE],
+    value = X_df[, feature, drop = TRUE]
+  )
+  ggplot(plot_data, aes(x = value, y = shap)) +
+    geom_point(alpha = 0.6, color = "steelblue") +
+    geom_smooth(color = "red", se = FALSE, method = "loess") +
+    labs(x = feature, y = "SHAP value",
+         title = paste("SHAP Dependence Plot for", feature)) +
+    theme_minimal()
+}
+
+# 4. Plot separately and save as variables
+plot_sbp <- shap_dependence_plot(shap_values, X_explain, "systolic_avg")
+plot_dbp <- shap_dependence_plot(shap_values, X_explain, "diastolic_avg")
+plot_bmi <- shap_dependence_plot(shap_values, X_explain, "BMI")
+
+# 5. SHAP Dependency Chart for Age
+age_shap_df <- data.frame(
+  Age = X_explain$age,
+  SHAP_value = shap_values[, "age"]
+)
+plot_age <- ggplot(age_shap_df, aes(x = Age, y = SHAP_value)) +
+  geom_point(alpha = 0.7, color = "darkblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(
+    title = "SHAP Dependence Plot for Age",
+    x = "Age (years)",
+    y = "SHAP Value (Contribution to Hypertension Prediction)"
+  ) +
+  theme_minimal()
+
+# 6. Save as a PNG file (recommended for thesis illustrations)
+ggsave("figure2_shap_sbp.png", plot = plot_sbp, width = 6, height = 4, dpi = 300)
+ggsave("figure3_shap_dbp.png", plot = plot_dbp, width = 6, height = 4, dpi = 300)
+ggsave("figure4_shap_bmi.png", plot = plot_bmi, width = 6, height = 4, dpi = 300)
+ggsave("figure5_shap_age.png", plot = plot_age, width = 6, height = 4, dpi = 300)
+
+print(plot_sbp)
+print(plot_dbp)
+print(plot_bmi)
+print(plot_age)
+```
+
+
